@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from typing import Union
+from typing import Optional, Union
 
 from .parallel_experts import ParallelExperts, flatten_sort_count
 
@@ -86,11 +86,25 @@ class MLP(nn.Module):
             Virtual experts have indices [num_experts, num_experts + num_virtual_experts).
             They participate in routing but perform no computation (identity function).
             Useful for load balancing while allowing some tokens to skip MLP computation.
+        fp8: Whether to use FP8 storage mode for expert weights.
+            When enabled, expert weights are stored in FP8 format with per-row scales.
+            Forward pass uses FP8 matmul kernel, backward pass uses full precision.
+            Call quantize_weights() after loading weights.
+        qat: Quantization-Aware Training mode for experts:
+            - "fp8": FP8 fake quantization with Straight-Through Estimator (STE)
+            - "int4": INT4 fake quantization with STE
+            - None: No QAT (default)
+            QAT keeps full-precision weights but simulates quantization in forward pass.
+            Gradients flow through via STE, allowing the model to adapt to quantization.
+        qat_group_size: Group size for INT4 QAT quantization (default: 32)
 
     Example:
         >>> mlp = MLP(768, 3072, num_experts=8, top_k=2)  # default swiglu
         >>> mlp = MLP(768, 3072, num_experts=8, top_k=2, activation="relu2")
         >>> mlp = MLP(768, 3072, num_experts=8, top_k=2, num_virtual_experts=2)  # 8 real + 2 virtual
+        >>> mlp = MLP(768, 3072, num_experts=8, top_k=2, fp8=True)  # FP8 storage
+        >>> mlp = MLP(768, 3072, num_experts=8, top_k=2, qat="fp8")  # FP8 QAT
+        >>> mlp = MLP(768, 3072, num_experts=8, top_k=2, qat="int4")  # INT4 QAT
     """
     def __init__(
         self,
@@ -101,6 +115,9 @@ class MLP(nn.Module):
         bias: bool = False,
         activation: Union[str, nn.Module] = "swiglu",
         num_virtual_experts: int = 0,
+        fp8: bool = False,
+        qat: Optional[str] = None,
+        qat_group_size: int = 32,
     ):
         super().__init__()
 
@@ -109,6 +126,9 @@ class MLP(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.top_k = min(top_k, num_experts + num_virtual_experts)
+        self.fp8 = fp8
+        self.qat = qat
+        self.qat_group_size = qat_group_size
 
         # Resolve activation and determine if gated
         if isinstance(activation, str):
@@ -124,12 +144,21 @@ class MLP(nn.Module):
         # Create expert layers based on gating
         if self._is_gated:
             # Gated: first layer outputs 2x hidden_size
-            self.experts = ParallelExperts(num_experts, input_size, 2 * hidden_size, bias=bias)
+            self.experts = ParallelExperts(
+                num_experts, input_size, 2 * hidden_size,
+                bias=bias, fp8=fp8, qat=qat, qat_group_size=qat_group_size
+            )
         else:
             # Non-gated: standard hidden_size
-            self.experts = ParallelExperts(num_experts, input_size, hidden_size, bias=bias)
+            self.experts = ParallelExperts(
+                num_experts, input_size, hidden_size,
+                bias=bias, fp8=fp8, qat=qat, qat_group_size=qat_group_size
+            )
 
-        self.output_experts = ParallelExperts(num_experts, hidden_size, input_size, bias=bias)
+        self.output_experts = ParallelExperts(
+            num_experts, hidden_size, input_size,
+            bias=bias, fp8=fp8, qat=qat, qat_group_size=qat_group_size
+        )
 
     @property
     def total_num_experts(self) -> int:
@@ -139,7 +168,22 @@ class MLP(nn.Module):
     def extra_repr(self):
         gated_str = "gated" if self._is_gated else "nongated"
         virtual_str = f', virtual={self.num_virtual_experts}' if self.num_virtual_experts > 0 else ''
-        return f'k={self.top_k}, activation={self._activation_name}, type={gated_str}{virtual_str}'
+        fp8_str = ', fp8=True' if self.fp8 else ''
+        qat_str = f', qat={self.qat!r}' if self.qat else ''
+        return f'k={self.top_k}, activation={self._activation_name}, type={gated_str}{virtual_str}{fp8_str}{qat_str}'
+
+    def quantize_weights(self) -> None:
+        """
+        Quantize expert weights to FP8 format.
+
+        Call this after loading weights or periodically during training to update
+        the FP8 weight cache. The FP8 weights are used for forward pass while
+        full precision weights are maintained for gradient computation.
+        """
+        if not self.fp8:
+            raise RuntimeError("FP8 mode not enabled. Initialize MLP with fp8=True")
+        self.experts.quantize_weights()
+        self.output_experts.quantize_weights()
 
     def forward(self, x: torch.Tensor, expert_p: torch.Tensor, expert_idxs: torch.Tensor):
         x_shape = x.size()
@@ -221,11 +265,15 @@ class EmbeddingMLP(nn.Module):
         num_virtual_experts: Number of virtual experts that perform identity operation.
             Virtual experts have indices [num_experts, num_experts + num_virtual_experts).
             They participate in routing but perform no computation (identity function).
+        fp8: Whether to use FP8 storage mode for expert weights.
+        qat: Quantization-Aware Training mode ("fp8", "int4", or None)
+        qat_group_size: Group size for INT4 QAT quantization (default: 32)
 
     Example:
         >>> mlp = EmbeddingMLP(768, 3072, num_experts=8, top_k=2, vocab_size=32000)
         >>> y = mlp(x, expert_weights, expert_idxs, token_idxs)
         >>> mlp = EmbeddingMLP(768, 3072, num_experts=8, top_k=2, vocab_size=32000, num_virtual_experts=2)
+        >>> mlp = EmbeddingMLP(768, 3072, num_experts=8, top_k=2, vocab_size=32000, qat="fp8")
     """
     def __init__(
         self,
@@ -237,6 +285,9 @@ class EmbeddingMLP(nn.Module):
         bias: bool = False,
         activation: Union[str, nn.Module] = "relu2",
         num_virtual_experts: int = 0,
+        fp8: bool = False,
+        qat: Optional[str] = None,
+        qat_group_size: int = 32,
     ):
         super().__init__()
 
@@ -246,6 +297,9 @@ class EmbeddingMLP(nn.Module):
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
         self.top_k = min(top_k, num_experts + num_virtual_experts)
+        self.fp8 = fp8
+        self.qat = qat
+        self.qat_group_size = qat_group_size
 
         # Resolve activation (only non-gated supported)
         if isinstance(activation, str):
@@ -262,8 +316,14 @@ class EmbeddingMLP(nn.Module):
             self._activation_name = type(activation).__name__
 
         # w1: up projection, w2: down projection
-        self.experts = ParallelExperts(num_experts, input_size, hidden_size, bias=bias)
-        self.output_experts = ParallelExperts(num_experts, hidden_size, input_size, bias=bias)
+        self.experts = ParallelExperts(
+            num_experts, input_size, hidden_size,
+            bias=bias, fp8=fp8, qat=qat, qat_group_size=qat_group_size
+        )
+        self.output_experts = ParallelExperts(
+            num_experts, hidden_size, input_size,
+            bias=bias, fp8=fp8, qat=qat, qat_group_size=qat_group_size
+        )
 
         # Embedding per expert: (num_experts, vocab_size, hidden_size)
         self.embedding = nn.Parameter(torch.empty(num_experts, vocab_size, hidden_size))
@@ -279,10 +339,24 @@ class EmbeddingMLP(nn.Module):
 
     def extra_repr(self):
         virtual_str = f', virtual={self.num_virtual_experts}' if self.num_virtual_experts > 0 else ''
+        fp8_str = ', fp8=True' if self.fp8 else ''
+        qat_str = f', qat={self.qat!r}' if self.qat else ''
         return (
             f'k={self.top_k}, activation={self._activation_name}, '
-            f'vocab_size={self.vocab_size}{virtual_str}'
+            f'vocab_size={self.vocab_size}{virtual_str}{fp8_str}{qat_str}'
         )
+
+    def quantize_weights(self) -> None:
+        """
+        Quantize expert weights to FP8 format (for fp8=True mode).
+
+        Call this after loading weights or periodically during training to update
+        the FP8 weight cache.
+        """
+        if not self.fp8:
+            raise RuntimeError("FP8 mode not enabled. Initialize EmbeddingMLP with fp8=True")
+        self.experts.quantize_weights()
+        self.output_experts.quantize_weights()
 
     def forward(
         self,
