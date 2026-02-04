@@ -1,30 +1,132 @@
 import torch
 from torch import nn
+from typing import Union
 
 from .parallel_experts import ParallelExperts, flatten_sort_count
 
+
+class ReluSquared(nn.Module):
+    """ReLU² activation: relu(x)^2"""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.relu(x).square()
+
+
+# Registry of non-gated activations (use 2 weight matrices: w2(act(w1(x))))
+NONGATED_ACTIVATIONS = {
+    "relu": nn.ReLU,
+    "relu2": ReluSquared,
+    "gelu": nn.GELU,
+    "silu": nn.SiLU,
+    "tanh": nn.Tanh,
+}
+
+# Registry of gated activations (use gated structure: w2(act(gate) * h))
+GATED_ACTIVATIONS = {
+    "swiglu": nn.SiLU,  # SwiGLU: swish(gate) * h
+    "geglu": nn.GELU,   # GeGLU: gelu(gate) * h
+    "reglu": nn.ReLU,   # ReGLU: relu(gate) * h
+}
+
+
+def get_activation(activation: Union[str, nn.Module, None]) -> tuple[nn.Module, bool]:
+    """
+    Get activation module and whether it's gated.
+
+    Args:
+        activation: Either a string name (e.g., "swiglu", "relu2") or an nn.Module
+
+    Returns:
+        Tuple of (activation_module, is_gated)
+    """
+    if activation is None:
+        return nn.Identity(), False
+
+    if isinstance(activation, nn.Module):
+        return activation, False
+
+    if isinstance(activation, str):
+        activation_lower = activation.lower()
+
+        if activation_lower in GATED_ACTIVATIONS:
+            return GATED_ACTIVATIONS[activation_lower](), True
+        elif activation_lower in NONGATED_ACTIVATIONS:
+            return NONGATED_ACTIVATIONS[activation_lower](), False
+        else:
+            available = list(GATED_ACTIVATIONS.keys()) + list(NONGATED_ACTIVATIONS.keys())
+            raise ValueError(
+                f"Unknown activation '{activation}'. "
+                f"Available: {available}"
+            )
+
+    raise TypeError(f"activation must be str or nn.Module, got {type(activation)}")
+
+
 class MLP(nn.Module):
+    """
+    Expert MLP that supports both gated and non-gated activations.
+
+    Gated activations (swiglu, geglu, reglu):
+        w2(act(gate) * h) where [h, gate] = w1(x)
+        Uses 3 effective weight matrices (first layer outputs 2x hidden_size)
+
+    Non-gated activations (relu, relu2, gelu, silu, tanh):
+        w2(act(w1(x)))
+        Uses 2 weight matrices
+
+    Args:
+        input_size: Input dimension
+        hidden_size: Hidden dimension (intermediate size)
+        num_experts: Number of experts
+        top_k: Number of experts to route to per token
+        bias: Whether to use bias in linear layers
+        activation: Activation name string (default: "swiglu") or nn.Module
+            Gated: "swiglu", "geglu", "reglu"
+            Non-gated: "relu", "relu2", "gelu", "silu", "tanh"
+
+    Example:
+        >>> mlp = MLP(768, 3072, num_experts=8, top_k=2)  # default swiglu
+        >>> mlp = MLP(768, 3072, num_experts=8, top_k=2, activation="relu2")
+    """
     def __init__(
         self,
-        input_size,
-        hidden_size,
-        num_experts,
-        top_k,
-        bias=False,
-        activation=None,
+        input_size: int,
+        hidden_size: int,
+        num_experts: int,
+        top_k: int,
+        bias: bool = False,
+        activation: Union[str, nn.Module] = "swiglu",
     ):
-        super(MLP, self).__init__()
+        super().__init__()
 
         self.num_experts = num_experts
         self.input_size = input_size
         self.hidden_size = hidden_size
-        self.experts = ParallelExperts(num_experts, input_size, hidden_size, bias=bias)
+        self.top_k = min(top_k, num_experts)
+
+        # Resolve activation and determine if gated
+        if isinstance(activation, str):
+            act_module, is_gated = get_activation(activation)
+            self.activation = act_module
+            self._activation_name = activation
+            self._is_gated = is_gated
+        else:
+            self.activation = activation
+            self._activation_name = type(activation).__name__
+            self._is_gated = False
+
+        # Create expert layers based on gating
+        if self._is_gated:
+            # Gated: first layer outputs 2x hidden_size
+            self.experts = ParallelExperts(num_experts, input_size, 2 * hidden_size, bias=bias)
+        else:
+            # Non-gated: standard hidden_size
+            self.experts = ParallelExperts(num_experts, input_size, hidden_size, bias=bias)
+
         self.output_experts = ParallelExperts(num_experts, hidden_size, input_size, bias=bias)
-        self.top_k = min(top_k, self.num_experts)
-        self.activation = activation
 
     def extra_repr(self):
-        return 'k={}'.format(self.top_k)
+        gated_str = "gated" if self._is_gated else "nongated"
+        return f'k={self.top_k}, activation={self._activation_name}, type={gated_str}'
 
     def forward(self, x: torch.Tensor, expert_p: torch.Tensor, expert_idxs: torch.Tensor):
         x_shape = x.size()
@@ -38,7 +140,13 @@ class MLP(nn.Module):
             expert_offsets,
             grouped_out=True
         )
-        h = self.activation(h)
+
+        if self._is_gated:
+            h, gates = h.chunk(2, dim=-1)
+            h = self.activation(gates) * h
+        else:
+            h = self.activation(h)
+
         y = self.output_experts(
             h, 1, sorted_expert_idxs, sorted_scattered_idxs,
             expert_offsets,
@@ -47,50 +155,3 @@ class MLP(nn.Module):
         )
         y = y.view(*x_shape[:-1], y.size(-1))
         return y
-
-class GLUMLP(nn.Module):
-    def __init__(
-        self, 
-        input_size, 
-        hidden_size,
-        num_experts,
-        top_k,
-        bias=False,
-        activation=nn.SiLU(),
-    ):
-        super(GLUMLP, self).__init__()
-
-        self.num_experts = num_experts
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.experts = ParallelExperts(num_experts, input_size, 2 * hidden_size, bias=bias)
-        self.output_experts = ParallelExperts(num_experts, hidden_size, input_size, bias=bias)
-        self.top_k = min(top_k, self.num_experts)
-        self.activation = activation
-
-    def extra_repr(self):
-        return 'k={}'.format(self.top_k)
-
-    def forward(self, x: torch.Tensor, expert_p: torch.Tensor, expert_idxs: torch.Tensor):
-        x_shape = x.size()
-        x = x.view(-1, x_shape[-1])
-        sorted_expert_idxs, sorted_scattered_idxs, expert_offsets = \
-            flatten_sort_count(expert_idxs, num_experts=self.num_experts)
-
-
-        h, gates  = self.experts(
-            x, self.top_k,
-            sorted_expert_idxs, sorted_scattered_idxs,
-            expert_offsets,
-            grouped_out=True
-        ).chunk(2, dim=-1)
-        h = self.activation(gates) * h
-        y = self.output_experts(
-            h, 1, sorted_expert_idxs, sorted_scattered_idxs,
-            expert_offsets,
-            grouped_in=True,
-            gates=expert_p,
-        )
-        y = y.view(*x_shape[:-1], y.size(-1))
-        return y
-

@@ -1,4 +1,7 @@
 from .parallel_experts import flatten_sort_count, parallel_linear, ParallelExperts
+from .mlp import (
+    MLP, ReluSquared, GATED_ACTIVATIONS, NONGATED_ACTIVATIONS, get_activation
+)
 from . import parallel_experts
 from . import kernels
 from . import mlp
@@ -11,5 +14,10 @@ __all__ = [
     "parallel_experts",
     "kernels",
     "mlp",
-    "utils"
+    "utils",
+    "MLP",
+    "ReluSquared",
+    "GATED_ACTIVATIONS",
+    "NONGATED_ACTIVATIONS",
+    "get_activation",
 ]
