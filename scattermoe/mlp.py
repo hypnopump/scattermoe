@@ -155,3 +155,134 @@ class MLP(nn.Module):
         )
         y = y.view(*x_shape[:-1], y.size(-1))
         return y
+
+
+class EmbeddingMLP(nn.Module):
+    """
+    Embedding-gated MLP for MoE: w2(act(w1(x)) * embd(token_idx))
+
+    Replaces the gate projection with an embedding lookup per token.
+    Each expert has its own embedding table. The gate is retrieved by
+    token vocabulary index rather than computed from the input.
+
+    Uses 2 weight matrices + 1 embedding per expert.
+    Only supports non-gated activations (relu, relu2, gelu, silu, tanh).
+
+    Args:
+        input_size: Input dimension
+        hidden_size: Hidden dimension (intermediate size)
+        num_experts: Number of experts
+        top_k: Number of experts to route to per token
+        vocab_size: Vocabulary size for the embedding
+        bias: Whether to use bias in linear layers
+        activation: Activation name string (default: "relu2") or nn.Module
+            Supported: "relu", "relu2", "gelu", "silu", "tanh"
+
+    Example:
+        >>> mlp = EmbeddingMLP(768, 3072, num_experts=8, top_k=2, vocab_size=32000)
+        >>> y = mlp(x, expert_weights, expert_idxs, token_idxs)
+    """
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_experts: int,
+        top_k: int,
+        vocab_size: int,
+        bias: bool = False,
+        activation: Union[str, nn.Module] = "relu2",
+    ):
+        super().__init__()
+
+        self.num_experts = num_experts
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.vocab_size = vocab_size
+        self.top_k = min(top_k, num_experts)
+
+        # Resolve activation (only non-gated supported)
+        if isinstance(activation, str):
+            act_module, is_gated = get_activation(activation)
+            if is_gated:
+                raise ValueError(
+                    f"'{activation}' is a gated activation. "
+                    f"EmbeddingMLP only supports non-gated activations: {list(NONGATED_ACTIVATIONS.keys())}"
+                )
+            self.activation = act_module
+            self._activation_name = activation
+        else:
+            self.activation = activation
+            self._activation_name = type(activation).__name__
+
+        # w1: up projection, w2: down projection
+        self.experts = ParallelExperts(num_experts, input_size, hidden_size, bias=bias)
+        self.output_experts = ParallelExperts(num_experts, hidden_size, input_size, bias=bias)
+
+        # Embedding per expert: (num_experts, vocab_size, hidden_size)
+        self.embedding = nn.Parameter(torch.empty(num_experts, vocab_size, hidden_size))
+        self.reset_embedding_parameters()
+
+    def reset_embedding_parameters(self):
+        nn.init.normal_(self.embedding, std=0.02)
+
+    def extra_repr(self):
+        return (
+            f'k={self.top_k}, activation={self._activation_name}, '
+            f'vocab_size={self.vocab_size}'
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        expert_p: torch.Tensor,
+        expert_idxs: torch.Tensor,
+        token_idxs: torch.Tensor,
+    ):
+        """
+        Args:
+            x: Input tensor (batch, seq, input_size) or (batch*seq, input_size)
+            expert_p: Expert weights (batch*seq, top_k)
+            expert_idxs: Expert indices (batch*seq, top_k)
+            token_idxs: Vocabulary indices (batch*seq,)
+
+        Returns:
+            Output tensor with same shape as input
+        """
+        x_shape = x.size()
+        x = x.view(-1, x_shape[-1])
+
+        sorted_expert_idxs, sorted_scattered_idxs, expert_offsets = \
+            flatten_sort_count(expert_idxs, num_experts=self.num_experts)
+
+        # h = w1(x)
+        h = self.experts(
+            x, self.top_k,
+            sorted_expert_idxs, sorted_scattered_idxs,
+            expert_offsets,
+            grouped_out=True
+        )
+
+        # Apply activation: h = act(h)
+        h = self.activation(h)
+
+        # Lookup embedding gate for each (token, expert) pair
+        # sorted_scattered_idxs: maps sorted position -> flattened (token * top_k) position
+        # Original token index = sorted_scattered_idxs // top_k
+        original_token_idxs = sorted_scattered_idxs // self.top_k
+        token_vocab_idxs = token_idxs[original_token_idxs]
+
+        # Get embedding: embedding[expert_idx, vocab_idx, :]
+        emb_gate = self.embedding[sorted_expert_idxs, token_vocab_idxs]
+
+        # Gate: h = h * embd
+        h = h * emb_gate
+
+        # y = w2(h)
+        y = self.output_experts(
+            h, 1, sorted_expert_idxs, sorted_scattered_idxs,
+            expert_offsets,
+            grouped_in=True,
+            gates=expert_p,
+        )
+        y = y.view(*x_shape[:-1], y.size(-1))
+        return y
