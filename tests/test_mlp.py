@@ -319,3 +319,268 @@ class TestEmbeddingMLP:
                 num_experts=8, top_k=2, vocab_size=1000,
                 activation='swiglu'
             )
+
+
+def dumb_forward_with_virtual(m, x, expert_p, expert_idxs):
+    """Reference implementation that handles virtual experts (identity operation)."""
+    num_experts = m.num_experts  # Real experts only
+    output = torch.zeros_like(x)
+
+    for i in range(expert_idxs.size(0)):
+        for j in range(expert_idxs.size(1)):
+            expert_idx = expert_idxs[i, j].item()
+            weight = expert_p[i, j]
+
+            if expert_idx >= num_experts:
+                # Virtual expert: identity operation
+                output[i] += weight * x[i]
+            else:
+                # Real expert: MLP computation
+                if m._is_gated:
+                    h = F.linear(
+                        x[i], m.experts.weight[expert_idx],
+                        bias=m.experts.bias[expert_idx] if m.experts.bias is not None else None
+                    )
+                    h_dim = m.hidden_size
+                    h = m.activation(h[..., h_dim:]) * h[..., :h_dim]
+                else:
+                    h = m.activation(
+                        F.linear(
+                            x[i], m.experts.weight[expert_idx],
+                            bias=m.experts.bias[expert_idx] if m.experts.bias is not None else None
+                        )
+                    )
+                output[i] += weight * F.linear(
+                    h,
+                    m.output_experts.weight[expert_idx],
+                    bias=m.output_experts.bias[expert_idx] if m.output_experts.bias is not None else None
+                )
+    return output
+
+
+def dumb_forward_embedding_with_virtual(m, x, expert_p, expert_idxs, token_idxs):
+    """Reference implementation for EmbeddingMLP with virtual experts."""
+    num_experts = m.num_experts
+    output = torch.zeros_like(x)
+
+    for i in range(expert_idxs.size(0)):
+        for j in range(expert_idxs.size(1)):
+            expert_idx = expert_idxs[i, j].item()
+            weight = expert_p[i, j]
+
+            if expert_idx >= num_experts:
+                # Virtual expert: identity operation
+                output[i] += weight * x[i]
+            else:
+                # Real expert: EmbeddingMLP computation
+                h = m.activation(
+                    F.linear(
+                        x[i], m.experts.weight[expert_idx],
+                        bias=m.experts.bias[expert_idx] if m.experts.bias is not None else None
+                    )
+                )
+                # Apply embedding gate
+                h = h * m.embedding[expert_idx, token_idxs[i]]
+                output[i] += weight * F.linear(
+                    h,
+                    m.output_experts.weight[expert_idx],
+                    bias=m.output_experts.bias[expert_idx] if m.output_experts.bias is not None else None
+                )
+    return output
+
+
+class TestVirtualExperts:
+    """Test virtual experts (no-computation/identity experts)"""
+
+    @pytest.mark.parametrize('dtype', [torch.float32])
+    @pytest.mark.parametrize('activation', ['gelu', 'swiglu'])
+    @pytest.mark.parametrize('length', [1, 64, 256])
+    @pytest.mark.parametrize('num_virtual', [1, 2, 4])
+    @pytest.mark.parametrize('x_dim, h_dim, E, k', [
+        (128, 512, 8, 2),
+        (256, 1024, 4, 2),
+    ])
+    def test_virtual_experts_correctness(self, length, x_dim, h_dim, E, k, num_virtual, activation, dtype):
+        """Test that virtual experts produce correct output (identity operation)."""
+        total_experts = E + num_virtual
+
+        logits = torch.randn(length, total_experts, dtype=dtype)
+        weights = torch.softmax(logits.float(), axis=-1).cuda().to(dtype)
+        X = torch.randn(length, x_dim, dtype=dtype, requires_grad=True).cuda()
+        k_weights, k_idxs = torch.topk(weights, k)
+        k_weights = k_weights.detach().requires_grad_(True)
+
+        mlp = MLP(
+            input_size=x_dim, hidden_size=h_dim,
+            activation=activation,
+            num_experts=E, top_k=k,
+            num_virtual_experts=num_virtual,
+            bias=False
+        ).cuda().to(dtype)
+
+        # Verify total_num_experts property
+        assert mlp.total_num_experts == total_experts
+
+        Y = mlp(X, k_weights, k_idxs)
+        Y_ref = dumb_forward_with_virtual(mlp, X, k_weights, k_idxs)
+
+        tol = 1e-4 if dtype == torch.float32 else 1e-2
+        assert_diff("Y", Y_ref, Y, tolerance=tol)
+
+    @pytest.mark.parametrize('dtype', [torch.float32])
+    def test_all_virtual_experts(self, dtype):
+        """Test when all routed experts are virtual (pure identity)."""
+        length, x_dim, h_dim, E, k, num_virtual = 32, 128, 512, 4, 2, 4
+
+        # Route only to virtual experts (indices E to E+num_virtual-1)
+        X = torch.randn(length, x_dim, dtype=dtype, requires_grad=True).cuda()
+        k_idxs = torch.randint(E, E + num_virtual, (length, k)).cuda()
+        k_weights = torch.softmax(torch.randn(length, k, dtype=dtype), dim=-1).cuda()
+        k_weights = k_weights.detach().requires_grad_(True)
+
+        mlp = MLP(
+            input_size=x_dim, hidden_size=h_dim,
+            activation='gelu',
+            num_experts=E, top_k=k,
+            num_virtual_experts=num_virtual,
+            bias=False
+        ).cuda().to(dtype)
+
+        Y = mlp(X, k_weights, k_idxs)
+
+        # When all experts are virtual, output should be: sum(k_weights) * x per token
+        expected = X * k_weights.sum(dim=-1, keepdim=True)
+
+        tol = 1e-5
+        assert_diff("Y_all_virtual", expected, Y, tolerance=tol)
+
+    @pytest.mark.parametrize('dtype', [torch.float32])
+    def test_no_virtual_experts_unchanged(self, dtype):
+        """Test that num_virtual_experts=0 produces same results as before."""
+        length, x_dim, h_dim, E, k = 64, 128, 512, 8, 2
+
+        logits = torch.randn(length, E, dtype=dtype)
+        weights = torch.softmax(logits.float(), axis=-1).cuda().to(dtype)
+        X = torch.randn(length, x_dim, dtype=dtype, requires_grad=True).cuda()
+        k_weights, k_idxs = torch.topk(weights, k)
+        k_weights = k_weights.detach().requires_grad_(True)
+
+        # MLP without virtual experts
+        mlp = MLP(
+            input_size=x_dim, hidden_size=h_dim,
+            activation='gelu',
+            num_experts=E, top_k=k,
+            num_virtual_experts=0,
+            bias=False
+        ).cuda().to(dtype)
+
+        Y = mlp(X, k_weights, k_idxs)
+        Y_ref = dumb_forward_nongated(mlp, X, k_weights, k_idxs)
+
+        tol = 1e-4
+        assert_diff("Y", Y_ref, Y, tolerance=tol)
+
+    @pytest.mark.parametrize('dtype', [torch.float32])
+    def test_virtual_experts_gradient_flow(self, dtype):
+        """Test that gradients flow correctly through virtual experts."""
+        length, x_dim, h_dim, E, k, num_virtual = 32, 128, 512, 4, 2, 2
+
+        logits = torch.randn(length, E + num_virtual, dtype=dtype)
+        weights = torch.softmax(logits.float(), axis=-1).cuda().to(dtype)
+        X = torch.randn(length, x_dim, dtype=dtype, device='cuda')
+        X.requires_grad_(True)
+        k_weights, k_idxs = torch.topk(weights, k)
+        k_weights = k_weights.detach().requires_grad_(True)
+
+        mlp = MLP(
+            input_size=x_dim, hidden_size=h_dim,
+            activation='gelu',
+            num_experts=E, top_k=k,
+            num_virtual_experts=num_virtual,
+            bias=False
+        ).cuda().to(dtype)
+
+        Y = mlp(X, k_weights, k_idxs)
+        loss = Y.sum()
+        loss.backward()
+
+        assert X.grad is not None, "X gradient is None"
+        assert k_weights.grad is not None, "k_weights gradient is None"
+        assert mlp.experts.weight.grad is not None, "experts.weight gradient is None"
+        assert mlp.output_experts.weight.grad is not None, "output_experts.weight gradient is None"
+
+    @pytest.mark.parametrize('dtype', [torch.float32])
+    def test_embedding_mlp_virtual_experts(self, dtype):
+        """Test virtual experts in EmbeddingMLP."""
+        length, x_dim, h_dim, E, k, vocab_size, num_virtual = 32, 128, 512, 4, 2, 100, 2
+        total_experts = E + num_virtual
+
+        logits = torch.randn(length, total_experts, dtype=dtype)
+        weights = torch.softmax(logits.float(), axis=-1).cuda().to(dtype)
+        X = torch.randn(length, x_dim, dtype=dtype, requires_grad=True).cuda()
+        token_idxs = torch.randint(0, vocab_size, (length,)).cuda()
+        k_weights, k_idxs = torch.topk(weights, k)
+        k_weights = k_weights.detach().requires_grad_(True)
+
+        mlp = EmbeddingMLP(
+            input_size=x_dim, hidden_size=h_dim,
+            num_experts=E, top_k=k, vocab_size=vocab_size,
+            activation='relu2',
+            num_virtual_experts=num_virtual,
+            bias=False
+        ).cuda().to(dtype)
+
+        assert mlp.total_num_experts == total_experts
+
+        Y = mlp(X, k_weights, k_idxs, token_idxs)
+        Y_ref = dumb_forward_embedding_with_virtual(mlp, X, k_weights, k_idxs, token_idxs)
+
+        tol = 1e-4
+        assert_diff("Y", Y_ref, Y, tolerance=tol)
+
+    @pytest.mark.parametrize('dtype', [torch.float32])
+    def test_mixed_real_virtual_routing(self, dtype):
+        """Test mixed routing where some tokens go to real, some to virtual experts."""
+        length, x_dim, h_dim, E, k, num_virtual = 64, 128, 512, 4, 2, 2
+
+        X = torch.randn(length, x_dim, dtype=dtype, requires_grad=True).cuda()
+
+        # Create routing where half go to real experts, half to virtual
+        k_idxs = torch.zeros(length, k, dtype=torch.long).cuda()
+        k_idxs[:length//2, :] = torch.randint(0, E, (length//2, k)).cuda()  # Real experts
+        k_idxs[length//2:, :] = torch.randint(E, E + num_virtual, (length - length//2, k)).cuda()  # Virtual
+
+        k_weights = torch.softmax(torch.randn(length, k, dtype=dtype), dim=-1).cuda()
+        k_weights = k_weights.detach().requires_grad_(True)
+
+        mlp = MLP(
+            input_size=x_dim, hidden_size=h_dim,
+            activation='gelu',
+            num_experts=E, top_k=k,
+            num_virtual_experts=num_virtual,
+            bias=False
+        ).cuda().to(dtype)
+
+        Y = mlp(X, k_weights, k_idxs)
+        Y_ref = dumb_forward_with_virtual(mlp, X, k_weights, k_idxs)
+
+        tol = 1e-4
+        assert_diff("Y_mixed", Y_ref, Y, tolerance=tol)
+
+    def test_extra_repr_with_virtual(self):
+        """Test that extra_repr includes virtual expert count."""
+        mlp = MLP(
+            input_size=128, hidden_size=512,
+            num_experts=8, top_k=2,
+            num_virtual_experts=2
+        )
+        repr_str = mlp.extra_repr()
+        assert 'virtual=2' in repr_str
+
+        # Without virtual experts, should not appear
+        mlp_no_virtual = MLP(
+            input_size=128, hidden_size=512,
+            num_experts=8, top_k=2
+        )
+        repr_str_no_virtual = mlp_no_virtual.extra_repr()
+        assert 'virtual' not in repr_str_no_virtual

@@ -76,16 +76,21 @@ class MLP(nn.Module):
     Args:
         input_size: Input dimension
         hidden_size: Hidden dimension (intermediate size)
-        num_experts: Number of experts
+        num_experts: Number of experts with parameters
         top_k: Number of experts to route to per token
         bias: Whether to use bias in linear layers
         activation: Activation name string (default: "swiglu") or nn.Module
             Gated: "swiglu", "geglu", "reglu"
             Non-gated: "relu", "relu2", "gelu", "silu", "tanh"
+        num_virtual_experts: Number of virtual experts that perform identity operation.
+            Virtual experts have indices [num_experts, num_experts + num_virtual_experts).
+            They participate in routing but perform no computation (identity function).
+            Useful for load balancing while allowing some tokens to skip MLP computation.
 
     Example:
         >>> mlp = MLP(768, 3072, num_experts=8, top_k=2)  # default swiglu
         >>> mlp = MLP(768, 3072, num_experts=8, top_k=2, activation="relu2")
+        >>> mlp = MLP(768, 3072, num_experts=8, top_k=2, num_virtual_experts=2)  # 8 real + 2 virtual
     """
     def __init__(
         self,
@@ -95,13 +100,15 @@ class MLP(nn.Module):
         top_k: int,
         bias: bool = False,
         activation: Union[str, nn.Module] = "swiglu",
+        num_virtual_experts: int = 0,
     ):
         super().__init__()
 
         self.num_experts = num_experts
+        self.num_virtual_experts = num_virtual_experts
         self.input_size = input_size
         self.hidden_size = hidden_size
-        self.top_k = min(top_k, num_experts)
+        self.top_k = min(top_k, num_experts + num_virtual_experts)
 
         # Resolve activation and determine if gated
         if isinstance(activation, str):
@@ -124,15 +131,45 @@ class MLP(nn.Module):
 
         self.output_experts = ParallelExperts(num_experts, hidden_size, input_size, bias=bias)
 
+    @property
+    def total_num_experts(self) -> int:
+        """Total number of experts including virtual experts (for router configuration)."""
+        return self.num_experts + self.num_virtual_experts
+
     def extra_repr(self):
         gated_str = "gated" if self._is_gated else "nongated"
-        return f'k={self.top_k}, activation={self._activation_name}, type={gated_str}'
+        virtual_str = f', virtual={self.num_virtual_experts}' if self.num_virtual_experts > 0 else ''
+        return f'k={self.top_k}, activation={self._activation_name}, type={gated_str}{virtual_str}'
 
     def forward(self, x: torch.Tensor, expert_p: torch.Tensor, expert_idxs: torch.Tensor):
         x_shape = x.size()
         x = x.view(-1, x_shape[-1])
+
+        # Handle virtual experts (identity operation)
+        if self.num_virtual_experts > 0:
+            # Identify virtual expert assignments (indices >= num_experts)
+            virtual_mask = expert_idxs >= self.num_experts  # (num_tokens, top_k)
+
+            # Sum of routing weights to virtual experts per token
+            virtual_weights = (expert_p * virtual_mask).sum(dim=-1, keepdim=True)  # (num_tokens, 1)
+
+            # Virtual contribution: identity weighted by routing weights
+            y_virtual = x * virtual_weights  # (num_tokens, input_size)
+
+            # For real expert processing: remap virtual indices to 0 and zero their weights
+            # This ensures the kernel doesn't access out-of-bounds expert weights
+            real_expert_idxs = expert_idxs.clone()
+            real_expert_idxs[virtual_mask] = 0  # Map to expert 0 (contribution will be zeroed)
+
+            real_expert_p = expert_p.clone()
+            real_expert_p[virtual_mask] = 0  # Zero weight for virtual assignments
+        else:
+            real_expert_idxs = expert_idxs
+            real_expert_p = expert_p
+            y_virtual = 0
+
         sorted_expert_idxs, sorted_scattered_idxs, expert_offsets = \
-            flatten_sort_count(expert_idxs, num_experts=self.num_experts)
+            flatten_sort_count(real_expert_idxs, num_experts=self.num_experts)
 
         h = self.experts(
             x, self.top_k,
@@ -151,8 +188,12 @@ class MLP(nn.Module):
             h, 1, sorted_expert_idxs, sorted_scattered_idxs,
             expert_offsets,
             grouped_in=True,
-            gates=expert_p,
+            gates=real_expert_p,
         )
+
+        # Add virtual expert contribution (identity)
+        y = y + y_virtual
+
         y = y.view(*x_shape[:-1], y.size(-1))
         return y
 
@@ -171,16 +212,20 @@ class EmbeddingMLP(nn.Module):
     Args:
         input_size: Input dimension
         hidden_size: Hidden dimension (intermediate size)
-        num_experts: Number of experts
+        num_experts: Number of experts with parameters
         top_k: Number of experts to route to per token
         vocab_size: Vocabulary size for the embedding
         bias: Whether to use bias in linear layers
         activation: Activation name string (default: "relu2") or nn.Module
             Supported: "relu", "relu2", "gelu", "silu", "tanh"
+        num_virtual_experts: Number of virtual experts that perform identity operation.
+            Virtual experts have indices [num_experts, num_experts + num_virtual_experts).
+            They participate in routing but perform no computation (identity function).
 
     Example:
         >>> mlp = EmbeddingMLP(768, 3072, num_experts=8, top_k=2, vocab_size=32000)
         >>> y = mlp(x, expert_weights, expert_idxs, token_idxs)
+        >>> mlp = EmbeddingMLP(768, 3072, num_experts=8, top_k=2, vocab_size=32000, num_virtual_experts=2)
     """
     def __init__(
         self,
@@ -191,14 +236,16 @@ class EmbeddingMLP(nn.Module):
         vocab_size: int,
         bias: bool = False,
         activation: Union[str, nn.Module] = "relu2",
+        num_virtual_experts: int = 0,
     ):
         super().__init__()
 
         self.num_experts = num_experts
+        self.num_virtual_experts = num_virtual_experts
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.vocab_size = vocab_size
-        self.top_k = min(top_k, num_experts)
+        self.top_k = min(top_k, num_experts + num_virtual_experts)
 
         # Resolve activation (only non-gated supported)
         if isinstance(activation, str):
@@ -225,10 +272,16 @@ class EmbeddingMLP(nn.Module):
     def reset_embedding_parameters(self):
         nn.init.normal_(self.embedding, std=0.02)
 
+    @property
+    def total_num_experts(self) -> int:
+        """Total number of experts including virtual experts (for router configuration)."""
+        return self.num_experts + self.num_virtual_experts
+
     def extra_repr(self):
+        virtual_str = f', virtual={self.num_virtual_experts}' if self.num_virtual_experts > 0 else ''
         return (
             f'k={self.top_k}, activation={self._activation_name}, '
-            f'vocab_size={self.vocab_size}'
+            f'vocab_size={self.vocab_size}{virtual_str}'
         )
 
     def forward(
@@ -251,8 +304,30 @@ class EmbeddingMLP(nn.Module):
         x_shape = x.size()
         x = x.view(-1, x_shape[-1])
 
+        # Handle virtual experts (identity operation)
+        if self.num_virtual_experts > 0:
+            # Identify virtual expert assignments (indices >= num_experts)
+            virtual_mask = expert_idxs >= self.num_experts  # (num_tokens, top_k)
+
+            # Sum of routing weights to virtual experts per token
+            virtual_weights = (expert_p * virtual_mask).sum(dim=-1, keepdim=True)  # (num_tokens, 1)
+
+            # Virtual contribution: identity weighted by routing weights
+            y_virtual = x * virtual_weights  # (num_tokens, input_size)
+
+            # For real expert processing: remap virtual indices to 0 and zero their weights
+            real_expert_idxs = expert_idxs.clone()
+            real_expert_idxs[virtual_mask] = 0
+
+            real_expert_p = expert_p.clone()
+            real_expert_p[virtual_mask] = 0
+        else:
+            real_expert_idxs = expert_idxs
+            real_expert_p = expert_p
+            y_virtual = 0
+
         sorted_expert_idxs, sorted_scattered_idxs, expert_offsets = \
-            flatten_sort_count(expert_idxs, num_experts=self.num_experts)
+            flatten_sort_count(real_expert_idxs, num_experts=self.num_experts)
 
         # h = w1(x)
         h = self.experts(
@@ -282,7 +357,11 @@ class EmbeddingMLP(nn.Module):
             h, 1, sorted_expert_idxs, sorted_scattered_idxs,
             expert_offsets,
             grouped_in=True,
-            gates=expert_p,
+            gates=real_expert_p,
         )
+
+        # Add virtual expert contribution (identity)
+        y = y + y_virtual
+
         y = y.view(*x_shape[:-1], y.size(-1))
         return y
