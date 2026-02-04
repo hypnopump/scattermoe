@@ -88,6 +88,53 @@ Y = mlp(X, k_weights, k_idxs, token_idxs)  # token_idxs: vocabulary indices
 
 `EmbeddingMLP` also supports `num_virtual_experts`.
 
+### Quantization-Aware Training (QAT)
+
+ScatterMoE supports quantization-aware training for expert weights, allowing models to learn to adapt to quantization constraints during training. This uses fake quantization with Straight-Through Estimator (STE) - forward pass simulates quantization noise while gradients flow through unchanged to update full-precision master weights.
+
+**Available QAT modes:**
+
+| Mode | Parameter | Description |
+|------|-----------|-------------|
+| FP8 | `qat="fp8"` | FP8 E4M3 fake quantization with per-row scaling |
+| INT4 | `qat="int4"` | INT4 fake quantization with group-wise scaling |
+
+```python
+# FP8 QAT
+mlp = MLP(768, 3072, num_experts=8, top_k=2, qat="fp8")
+
+# INT4 QAT with default group size (32)
+mlp = MLP(768, 3072, num_experts=8, top_k=2, qat="int4")
+
+# INT4 QAT with custom group size
+mlp = MLP(768, 3072, num_experts=8, top_k=2, qat="int4", qat_group_size=64)
+```
+
+**How it works:**
+- **Forward pass**: Weights are quantized then immediately dequantized (fake quantization), introducing quantization noise that the model learns to handle
+- **Backward pass**: STE passes gradients through the quantization operation unchanged, allowing full-precision weight updates
+- **Result**: Model learns weight distributions that are robust to quantization, enabling better post-training quantization or direct deployment with quantized weights
+
+### FP8 Storage Mode
+
+For inference or when you want to store weights in FP8 format (separate from QAT), use `fp8=True`:
+
+```python
+mlp = MLP(768, 3072, num_experts=8, top_k=2, fp8=True)
+
+# After loading/initializing weights, quantize them:
+mlp.quantize_weights()
+
+# Forward pass uses FP8 Triton kernel
+Y = mlp(X, k_weights, k_idxs)
+```
+
+This mode stores weights in FP8 buffers with per-row scales and uses a custom FP8 Triton kernel for the forward pass, while backward uses full-precision weights for accurate gradients.
+
+**QAT vs FP8 Storage:**
+- `qat="fp8"`: Keeps full-precision weights, simulates FP8 during forward. Use during training.
+- `fp8=True`: Actually stores FP8 weights in buffers. Requires `quantize_weights()` call. Better for inference.
+
 ## Bibtex
 If you use ScatterMoE in your project, cite us!
 ```bibtex
