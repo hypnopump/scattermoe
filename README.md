@@ -35,6 +35,59 @@ Y = mlp(
 )
 ```
 
+## Additional Features
+
+### Activation Types
+
+The MLP supports both gated and non-gated activations via string names:
+
+**Gated activations** (3 weight matrices: `w2(act(gate) * h)` where `[h, gate] = w1(x)`):
+- `"swiglu"` (default), `"geglu"`, `"reglu"`
+
+**Non-gated activations** (2 weight matrices: `w2(act(w1(x)))`):
+- `"relu"`, `"relu2"`, `"gelu"`, `"silu"`, `"tanh"`
+
+```python
+mlp = MLP(768, 3072, num_experts=8, top_k=2, activation="swiglu")  # default
+mlp = MLP(768, 3072, num_experts=8, top_k=2, activation="relu2")   # ReLU squared
+mlp = MLP(768, 3072, num_experts=8, top_k=2, activation="geglu")   # GeGLU gated
+```
+
+You can also pass an `nn.Module` instance for custom activations.
+
+### Virtual Experts
+
+Virtual experts participate in routing but perform an identity operation instead of MLP computation. This allows tokens to "skip" the MLP while still being part of the routing distribution, useful for load balancing or allowing the model to learn when MLP computation is unnecessary.
+
+```python
+# 8 real experts + 2 virtual experts = 10 total for routing
+mlp = MLP(768, 3072, num_experts=8, top_k=2, num_virtual_experts=2)
+
+# Router should output indices in [0, mlp.total_num_experts)
+# Indices [0, 7] route to real experts, [8, 9] route to virtual (identity)
+```
+
+### EmbeddingMLP
+
+`EmbeddingMLP` replaces the gate projection with per-expert embedding lookups based on token vocabulary indices: `w2(act(w1(x)) * embd(token_idx))`.
+
+```python
+from scattermoe.mlp import EmbeddingMLP
+
+mlp = EmbeddingMLP(
+    input_size=768,
+    hidden_size=3072,
+    num_experts=8,
+    top_k=2,
+    vocab_size=32000,
+    activation="relu2",  # only non-gated activations supported
+)
+
+Y = mlp(X, k_weights, k_idxs, token_idxs)  # token_idxs: vocabulary indices
+```
+
+`EmbeddingMLP` also supports `num_virtual_experts`.
+
 ## Bibtex
 If you use ScatterMoE in your project, cite us!
 ```bibtex
